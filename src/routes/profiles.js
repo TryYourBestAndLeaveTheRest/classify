@@ -44,8 +44,6 @@ router.post('/', async (req, res, next) => {
           getNationality(name),
         ]);
 
-        console.log('Country data:' ,nationalityData.country );
-
         if (!genderData.gender || genderData.count === 0) {
           return res.status(502).json({ status: 'error', message: 'Genderize returned an invalid response' });
         }
