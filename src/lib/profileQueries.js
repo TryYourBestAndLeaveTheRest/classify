@@ -1,6 +1,6 @@
 const path = require('path');
 
-const seedProfiles = require(path.resolve(__dirname, '../../..', 'seed_profiles.json'));
+const seedProfiles = require(path.resolve(__dirname, '../..', 'seed_profiles.json'));
 
 const allowedListQueryKeys = new Set([
   'gender',
