@@ -1,98 +1,128 @@
 const express = require('express');
 const { v7: uuidv7 } = require('uuid');
-const db = require('../lib/db');
+const { query } = require('../lib/db');
 const { getGender, getAge, getNationality } = require('../lib/apiClients');
+const {
+  getAgeGroup,
+  formatProfile,
+  parseProfileFilters,
+  buildProfilesQuery,
+  countryLookup,
+} = require('../lib/profileQueries');
 
 const router = express.Router();
 
-const getAgeGroup = (age) => {
-  if (age >= 0 && age <= 12) return 'child';
-  if (age >= 13 && age <= 19) return 'teenager';
-  if (age >= 20 && age <= 59) return 'adult';
-  if (age >= 60) return 'senior';
-  return 'unknown';
+const createHttpError = (message, statusCode) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 };
 
 router.post('/', async (req, res, next) => {
   const { name } = req.body;
 
-  if (!name || typeof name !== 'string') {
-    return res.status(400).json({ status: 'error', message: 'Missing or empty name' });
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return next(createHttpError('Missing or empty name', 400));
   }
 
   try {
-    db.get('SELECT * FROM profiles WHERE name = ?', [name.toLowerCase()], async (err, row) => {
-      if (err) {
-        return next(err);
-      }
-      if (row) {
-        return res.status(200).json({
-          status: 'success',
-          message: 'Profile already exists',
-          data: {
-            ...row,
-            gender_probability: row.gender_probability,
-            country_probability: row.country_probability,
-          },
-        });
-      }
+    const existing = await query('SELECT * FROM profiles WHERE name = $1', [name.trim()]);
+    if (existing.rows.length > 0) {
+      return res.status(200).json({
+        status: 'success',
+        message: 'Profile already exists',
+        data: formatProfile(existing.rows[0]),
+      });
+    }
 
-      try {
-        const [genderData, ageData, nationalityData] = await Promise.all([
-          getGender(name),
-          getAge(name),
-          getNationality(name),
-        ]);
+    const [genderData, ageData, nationalityData] = await Promise.all([
+      getGender(name),
+      getAge(name),
+      getNationality(name),
+    ]);
 
-        if (!genderData.gender || genderData.count === 0) {
-          return res.status(502).json({ status: 'error', message: 'Genderize returned an invalid response' });
-        }
-        if (ageData.age === null) {
-          return res.status(502).json({ status: 'error', message: 'Agify returned an invalid response' });
-        }
-        if (!nationalityData.country || nationalityData.country.length === 0) {
-          return res.status(502).json({ status: 'error', message: 'Nationalize returned an invalid response' });
-        }
+    if (!genderData.gender || genderData.count === 0) {
+      return next(createHttpError('Genderize returned an invalid response', 502));
+    }
+    if (ageData.age === null) {
+      return next(createHttpError('Agify returned an invalid response', 502));
+    }
+    if (!nationalityData.country || nationalityData.country.length === 0) {
+      return next(createHttpError('Nationalize returned an invalid response', 502));
+    }
 
-        const topCountry = nationalityData.country.sort((a, b) => b.probability - a.probability)[0];
+    const topCountry = nationalityData.country.sort((left, right) => right.probability - left.probability)[0];
+    const countryDetails = countryLookup.get(String(topCountry.country_id).toLowerCase());
 
-        const newProfile = {
-          id: uuidv7(),
-          name: name.toLowerCase(),
-          gender: genderData.gender,
-          gender_probability: genderData.probability,
-          sample_size: genderData.count,
-          age: ageData.age,
-          age_group: getAgeGroup(ageData.age),
-          country_id: topCountry.country_id,
-          country_probability: topCountry.probability,
-          created_at: new Date().toISOString(),
-        };
+    const newProfile = {
+      id: uuidv7(),
+      name: name.trim(),
+      gender: genderData.gender,
+      gender_probability: genderData.probability,
+      age: ageData.age,
+      age_group: getAgeGroup(ageData.age),
+      country_id: topCountry.country_id.toUpperCase(),
+      country_name: countryDetails?.country_name || topCountry.country_id.toUpperCase(),
+      country_probability: topCountry.probability,
+      created_at: new Date().toISOString(),
+    };
 
-        db.run(
-          'INSERT INTO profiles (id, name, gender, gender_probability, sample_size, age, age_group, country_id, country_probability, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [
-            newProfile.id,
-            newProfile.name,
-            newProfile.gender,
-            newProfile.gender_probability,
-            newProfile.sample_size,
-            newProfile.age,
-            newProfile.age_group,
-            newProfile.country_id,
-            newProfile.country_probability,
-            newProfile.created_at,
-          ],
-          (err) => {
-            if (err) {
-              return next(err);
-            }
-            res.status(201).json({ status: 'success', data: newProfile });
-          }
-        );
-      } catch (error) {
-        next(error);
-      }
+    await query(
+      'INSERT INTO profiles (id, name, gender, gender_probability, age, age_group, country_id, country_name, country_probability, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+      [
+        newProfile.id,
+        newProfile.name,
+        newProfile.gender,
+        newProfile.gender_probability,
+        newProfile.age,
+        newProfile.age_group,
+        newProfile.country_id,
+        newProfile.country_name,
+        newProfile.country_probability,
+        newProfile.created_at,
+      ]
+    );
+
+    return res.status(201).json({ status: 'success', data: newProfile });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/search', async (req, res, next) => {
+  try {
+    const parsed = parseProfileFilters(req.query, { allowSearchOnly: true });
+    const { countSql, dataSql, values, limitOffsetValues } = buildProfilesQuery(parsed);
+
+    const totalResult = await query(countSql, values);
+    const dataResult = await query(dataSql, [...values, ...limitOffsetValues]);
+
+    return res.status(200).json({
+      status: 'success',
+      page: parsed.pagination.page,
+      limit: parsed.pagination.limit,
+      total: totalResult.rows[0].total,
+      data: dataResult.rows.map(formatProfile),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/', async (req, res, next) => {
+  try {
+    const parsed = parseProfileFilters(req.query);
+    const { countSql, dataSql, values, limitOffsetValues } = buildProfilesQuery(parsed);
+
+    const totalResult = await query(countSql, values);
+    const dataResult = await query(dataSql, [...values, ...limitOffsetValues]);
+
+    return res.status(200).json({
+      status: 'success',
+      page: parsed.pagination.page,
+      limit: parsed.pagination.limit,
+      total: totalResult.rows[0].total,
+      data: dataResult.rows.map(formatProfile),
     });
   } catch (error) {
     next(error);
@@ -101,58 +131,28 @@ router.post('/', async (req, res, next) => {
 
 router.get('/:id', (req, res, next) => {
   const { id } = req.params;
-  db.get('SELECT * FROM profiles WHERE id = ?', [id], (err, row) => {
-    if (err) {
-      return next(err);
-    }
-    if (!row) {
-      return res.status(404).json({ status: 'error', message: 'Profile not found' });
-    }
-    res.status(200).json({ status: 'success', data: row });
-  });
-});
+  query('SELECT id, name, gender, gender_probability, age, age_group, country_id, country_name, country_probability, created_at FROM profiles WHERE id = $1', [id])
+    .then((result) => {
+      if (result.rows.length === 0) {
+        return res.status(404).json({ status: 'error', message: 'Profile not found' });
+      }
 
-router.get('/', (req, res, next) => {
-  const { gender, country_id, age_group } = req.query;
-  let query = 'SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1';
-  const params = [];
-
-  if (gender) {
-    query += ' AND lower(gender) = ?';
-    params.push(gender.toLowerCase());
-  }
-  if (country_id) {
-    query += ' AND lower(country_id) = ?';
-    params.push(country_id.toLowerCase());
-  }
-  if (age_group) {
-    query += ' AND lower(age_group) = ?';
-    params.push(age_group.toLowerCase());
-  }
-
-  db.all(query, params, (err, rows) => {
-    if (err) {
-      return next(err);
-    }
-    res.status(200).json({
-      status: 'success',
-      count: rows.length,
-      data: rows,
-    });
-  });
+      return res.status(200).json({ status: 'success', data: formatProfile(result.rows[0]) });
+    })
+    .catch(next);
 });
 
 router.delete('/:id', (req, res, next) => {
   const { id } = req.params;
-  db.run('DELETE FROM profiles WHERE id = ?', [id], function (err) {
-    if (err) {
-      return next(err);
-    }
-    if (this.changes === 0) {
-      return res.status(404).json({ status: 'error', message: 'Profile not found' });
-    }
-    res.status(204).send();
-  });
+  query('DELETE FROM profiles WHERE id = $1', [id])
+    .then((result) => {
+      if (result.rowCount === 0) {
+        return res.status(404).json({ status: 'error', message: 'Profile not found' });
+      }
+
+      return res.status(204).send();
+    })
+    .catch(next);
 });
 
 module.exports = router;
