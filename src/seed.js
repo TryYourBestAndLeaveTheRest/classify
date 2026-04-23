@@ -3,7 +3,7 @@ const path = require('path');
 const { v7: uuidv7 } = require('uuid');
 const { ensureSchema, pool } = require('./lib/db');
 
-const seedFilePath = path.resolve(__dirname, '..', '..', 'seed_profiles.json');
+const seedFilePath = path.resolve(__dirname, '..', 'seed_profiles.json');
 
 const loadSeedProfiles = async () => {
   try {
